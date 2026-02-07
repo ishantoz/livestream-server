@@ -1,0 +1,30 @@
+[project]
+name = "livestream-server"
+version = "1.0.0"
+description = "High-performance ASGI server for live video streaming with synchronized audio"
+readme = "README.md"
+requires-python = ">=3.12"
+keywords = ["streaming", "video", "audio", "mjpeg", "asgi", "live"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+dependencies = [
+    "uvicorn[standard]>=0.40.0",
+]
+
+[project.scripts]
+livestream = "main:app"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
