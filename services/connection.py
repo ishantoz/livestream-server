@@ -1,12 +1,11 @@
 """
-Client connection management.
+Client connection management for HTTP streaming.
 Handles efficient tracking and cleanup of client connections.
 """
 
 import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
-from enum import Enum
 import logging
 import time
 
@@ -14,45 +13,34 @@ import time
 logger = logging.getLogger(__name__)
 
 
-class StreamType(Enum):
-    """Type of stream a client is subscribed to."""
-    VIDEO = "video"
-    AUDIO = "audio"
-
-
 @dataclass
 class ClientStats:
     """Statistics for a single client connection."""
     connected_at: float = field(default_factory=time.time)
-    frames_sent: int = 0
+    chunks_sent: int = 0
     bytes_sent: int = 0
-    frames_dropped: int = 0  # Backpressure tracking
+    chunks_dropped: int = 0  # Backpressure tracking
     last_activity: float = field(default_factory=time.time)
     
     def update(self, bytes_count: int) -> None:
         """Update stats after sending data."""
-        self.frames_sent += 1
+        self.chunks_sent += 1
         self.bytes_sent += bytes_count
         self.last_activity = time.time()
     
     def record_drop(self) -> None:
-        """Record a dropped frame due to backpressure."""
-        self.frames_dropped += 1
+        """Record a dropped chunk due to backpressure."""
+        self.chunks_dropped += 1
 
 
 class ClientQueue:
     """
-    Wrapper around asyncio.Queue with automatic cleanup and stats tracking.
-    Uses a context manager pattern for proper resource management.
+    Wrapper around asyncio.Queue with backpressure and stats tracking.
+    Each HTTP streaming client gets one queue for muxed fMP4 chunks.
     """
     
-    def __init__(
-        self,
-        maxsize: int = 2,
-        stream_type: StreamType = StreamType.VIDEO
-    ):
+    def __init__(self, maxsize: int = 4):
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
-        self._stream_type = stream_type
         self._stats = ClientStats()
         self._active = True
         self._id = id(self)
@@ -60,10 +48,6 @@ class ClientQueue:
     @property
     def id(self) -> int:
         return self._id
-    
-    @property
-    def stream_type(self) -> StreamType:
-        return self._stream_type
     
     @property
     def stats(self) -> ClientStats:
@@ -75,23 +59,23 @@ class ClientQueue:
     
     def put_nowait(self, item: bytes) -> bool:
         """
-        Put item in queue, dropping oldest if full (backpressure).
+        Put item in queue, dropping OLDEST if full (ring buffer backpressure).
         Returns True if successful, False if client is inactive.
+        
+        Unlike draining the whole queue, this only drops one item at a time
+        to maintain continuous segment delivery for fMP4 streaming.
         """
         if not self._active:
             return False
             
         try:
-            dropped = 0
-            while not self._queue.empty():
+            # Only drop if queue is full — keep as many segments as possible
+            if self._queue.full():
                 try:
                     self._queue.get_nowait()
-                    dropped += 1
+                    self._stats.chunks_dropped += 1
                 except asyncio.QueueEmpty:
-                    break
-            
-            if dropped > 0:
-                self._stats.frames_dropped += dropped
+                    pass
             
             self._queue.put_nowait(item)
             self._stats.update(len(item))
@@ -122,13 +106,13 @@ class ClientQueue:
 
 class ConnectionManager:
     """
-    Manages client connections for video and audio streams.
+    Manages HTTP streaming client connections for fMP4 streaming.
     
     Features:
-    - Efficient client tracking with automatic cleanup
-    - Memory-efficient queue management
+    - Single client type (muxed audio+video chunks)
+    - Caches fMP4 init segment for new clients
+    - Backpressure via queue-based dropping
     - Connection statistics and monitoring
-    - Thread-safe operations
     """
     
     _instance: Optional["ConnectionManager"] = None
@@ -144,125 +128,87 @@ class ConnectionManager:
         if self._initialized:
             return
             
-        self._video_clients: Dict[int, ClientQueue] = {}
-        self._audio_clients: Dict[int, ClientQueue] = {}
+        self._clients: Dict[int, ClientQueue] = {}
         self._lock = asyncio.Lock()
         self._max_clients: int = 100
+        self._init_segment: Optional[bytes] = None
         self._initialized = True
         
         logger.info("ConnectionManager initialized")
     
     @property
-    def video_client_count(self) -> int:
-        return len(self._video_clients)
+    def client_count(self) -> int:
+        return len(self._clients)
     
     @property
-    def audio_client_count(self) -> int:
-        return len(self._audio_clients)
+    def init_segment(self) -> Optional[bytes]:
+        """Get the cached fMP4 init segment (moov atom)."""
+        return self._init_segment
     
-    @property
-    def total_client_count(self) -> int:
-        return self.video_client_count + self.audio_client_count
+    def set_init_segment(self, data: bytes) -> None:
+        """Cache the fMP4 init segment for new clients."""
+        self._init_segment = data
+        logger.debug(f"Init segment cached ({len(data)} bytes)")
     
     def set_max_clients(self, max_clients: int) -> None:
         """Set maximum number of allowed clients."""
         self._max_clients = max_clients
     
-    async def register_video_client(self, maxsize: int = 2) -> Optional[ClientQueue]:
-        """Register a new video client."""
-        return await self._register_client(StreamType.VIDEO, maxsize)
-    
-    async def register_audio_client(self, maxsize: int = 10) -> Optional[ClientQueue]:
-        """Register a new audio client."""
-        return await self._register_client(StreamType.AUDIO, maxsize)
-    
-    async def _register_client(
-        self,
-        stream_type: StreamType,
-        maxsize: int
-    ) -> Optional[ClientQueue]:
-        """Internal method to register a client."""
+    async def register_client(self, maxsize: int = 4) -> Optional[ClientQueue]:
+        """Register a new streaming client."""
         async with self._lock:
-            if self.total_client_count >= self._max_clients:
+            if self.client_count >= self._max_clients:
                 logger.warning(f"Max clients ({self._max_clients}) reached, rejecting connection")
                 return None
             
-            client = ClientQueue(maxsize=maxsize, stream_type=stream_type)
+            client = ClientQueue(maxsize=maxsize)
+            self._clients[client.id] = client
             
-            if stream_type == StreamType.VIDEO:
-                self._video_clients[client.id] = client
-            else:
-                self._audio_clients[client.id] = client
-            
-            logger.debug(f"Registered {stream_type.value} client {client.id}")
+            logger.debug(f"Registered client {client.id} (total: {self.client_count})")
             return client
     
     async def unregister_client(self, client: ClientQueue) -> None:
         """Unregister a client connection."""
         async with self._lock:
             client.close()
-            
-            if client.stream_type == StreamType.VIDEO:
-                self._video_clients.pop(client.id, None)
-            else:
-                self._audio_clients.pop(client.id, None)
+            self._clients.pop(client.id, None)
             
             logger.debug(
-                f"Unregistered {client.stream_type.value} client {client.id} "
-                f"(sent {client.stats.frames_sent} frames, {client.stats.bytes_sent} bytes)"
+                f"Unregistered client {client.id} "
+                f"(sent {client.stats.chunks_sent} chunks, {client.stats.bytes_sent} bytes, "
+                f"total: {self.client_count})"
             )
     
-    def broadcast_video(self, frame: bytes) -> int:
+    def broadcast(self, chunk: bytes) -> int:
         """
-        Broadcast video frame to all connected video clients.
-        Returns number of clients that received the frame.
-        """
-        sent_count = 0
-        dead_clients = []
-        
-        for client_id, client in self._video_clients.items():
-            if client.put_nowait(frame):
-                sent_count += 1
-            else:
-                dead_clients.append(client_id)
-        
-        for client_id in dead_clients:
-            self._video_clients.pop(client_id, None)
-        
-        return sent_count
-    
-    def broadcast_audio(self, chunk: bytes) -> int:
-        """
-        Broadcast audio chunk to all connected audio clients.
+        Broadcast fMP4 chunk to all connected clients.
         Returns number of clients that received the chunk.
         """
         sent_count = 0
         dead_clients = []
         
-        for client_id, client in self._audio_clients.items():
-            if client.qsize() < 10 and client.put_nowait(chunk):
+        for client_id, client in self._clients.items():
+            if client.put_nowait(chunk):
                 sent_count += 1
-            elif not client.is_active:
+            else:
                 dead_clients.append(client_id)
         
         for client_id in dead_clients:
-            self._audio_clients.pop(client_id, None)
+            self._clients.pop(client_id, None)
         
         return sent_count
     
     def get_stats(self) -> Dict[str, Any]:
         """Get connection statistics including backpressure metrics."""
         total_dropped = sum(
-            c.stats.frames_dropped 
-            for c in list(self._video_clients.values()) + list(self._audio_clients.values())
+            c.stats.chunks_dropped for c in self._clients.values()
         )
         
         return {
-            "video_clients": self.video_client_count,
-            "audio_clients": self.audio_client_count,
-            "total_clients": self.total_client_count,
+            "clients": self.client_count,
             "max_clients": self._max_clients,
-            "frames_dropped": total_dropped,
+            "chunks_dropped": total_dropped,
+            "init_segment_cached": self._init_segment is not None,
         }
     
     async def cleanup_inactive(self, timeout: float = 30.0) -> int:
@@ -272,21 +218,17 @@ class ConnectionManager:
         """
         async with self._lock:
             current_time = time.time()
-            removed = 0
+            dead = [
+                cid for cid, client in self._clients.items()
+                if current_time - client.stats.last_activity > timeout
+            ]
+            for cid in dead:
+                self._clients.pop(cid, None)
             
-            for clients in [self._video_clients, self._audio_clients]:
-                dead = [
-                    cid for cid, client in clients.items()
-                    if current_time - client.stats.last_activity > timeout
-                ]
-                for cid in dead:
-                    clients.pop(cid, None)
-                    removed += 1
+            if dead:
+                logger.info(f"Cleaned up {len(dead)} inactive clients")
             
-            if removed:
-                logger.info(f"Cleaned up {removed} inactive clients")
-            
-            return removed
+            return len(dead)
 
 
 connection_manager = ConnectionManager()

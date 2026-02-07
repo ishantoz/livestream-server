@@ -61,22 +61,23 @@ class VideoConfig:
     """Video streaming configuration."""
     file_path: str = "video.mp4"
     fps: int = 30
-    jpeg_quality: int = 5  # 2-31, lower is better (used when quality is None)
-    frame_buffer_size: int = 2
-    resolution: Optional[str] = None  # e.g., "1280x720", None = original (used when quality is None)
-    quality: Optional[float] = None   # 0.0 (worst) to 1.0 (best) — controls both resolution + jpeg
+    crf: int = 23                      # H.264 CRF (0=lossless, 51=worst). Lower = better.
+    audio_bitrate: str = "128k"        # AAC audio bitrate
+    resolution: Optional[str] = None   # e.g., "1280x720", None = original
+    quality: Optional[float] = None    # 0.0 (worst) to 1.0 (best) — controls CRF + resolution
+    chunk_buffer_size: int = 64        # Client queue size (large for raw byte streaming)
     
     @property
-    def effective_jpeg_quality(self) -> int:
-        """Get effective FFmpeg -q:v value (2=best, 31=worst).
+    def effective_crf(self) -> int:
+        """Get effective H.264 CRF value (0=lossless, 51=worst).
         
-        If quality is set, maps 1.0→2 and 0.0→31.
-        Otherwise uses the explicit jpeg_quality setting.
+        If quality is set, maps 1.0→18 (high quality) and 0.0→40 (low quality).
+        Otherwise uses the explicit crf setting.
         """
         if self.quality is not None:
             q = max(0.0, min(1.0, self.quality))
-            return round(31 - q * 29)  # 1.0→2, 0.0→31
-        return self.jpeg_quality
+            return round(40 - q * 22)  # 1.0→18, 0.0→40
+        return self.crf
     
     @property
     def effective_scale(self) -> Optional[float]:
@@ -108,23 +109,8 @@ class VideoConfig:
 
 @dataclass(frozen=True)
 class AudioConfig:
-    """Audio streaming configuration."""
-    sample_rate: int = 44100
-    channels: int = 2
-    bits_per_sample: int = 16
-    buffer_size: int = 10
-    
-    @property
-    def bytes_per_sample(self) -> int:
-        return self.bits_per_sample // 8
-    
-    @property
-    def byte_rate(self) -> int:
-        return self.sample_rate * self.channels * self.bytes_per_sample
-    
-    @property
-    def block_align(self) -> int:
-        return self.channels * self.bytes_per_sample
+    """Audio streaming configuration (AAC output)."""
+    bitrate: str = "128k"   # AAC bitrate
 
 
 @dataclass(frozen=True)
@@ -150,13 +136,13 @@ class AppConfig:
             video=VideoConfig(
                 file_path=os.getenv("VIDEO_FILE", "video.mp4"),
                 fps=int(os.getenv("VIDEO_FPS", "30")),
-                jpeg_quality=int(os.getenv("JPEG_QUALITY", "5")),
+                crf=int(os.getenv("VIDEO_CRF", "23")),
+                audio_bitrate=os.getenv("AUDIO_BITRATE", "128k"),
                 resolution=os.getenv("VIDEO_RESOLUTION"),  # e.g., "1280x720"
                 quality=float(os.environ["VIDEO_QUALITY"]) if "VIDEO_QUALITY" in os.environ else None,
             ),
             audio=AudioConfig(
-                sample_rate=int(os.getenv("AUDIO_SAMPLE_RATE", "44100")),
-                channels=int(os.getenv("AUDIO_CHANNELS", "2")),
+                bitrate=os.getenv("AUDIO_BITRATE", "128k"),
             ),
             server=ServerConfig(
                 host=os.getenv("SERVER_HOST", "127.0.0.1"),

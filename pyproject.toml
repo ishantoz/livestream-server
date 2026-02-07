@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "High-performance ASGI server for live video streaming with synchronized audio"
 readme = "README.md"
 requires-python = ">=3.12"
-keywords = ["streaming", "video", "audio", "mjpeg", "asgi", "live"]
+keywords = ["streaming", "video", "audio", "websocket", "fmp4", "mse", "asgi", "live"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",

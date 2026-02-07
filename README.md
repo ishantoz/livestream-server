@@ -4,18 +4,20 @@ A lightweight HTTP-based video streaming server built from scratch in Python.
 
 > **Learning project** — Built to understand how video streaming works at the protocol level. Experimental, not for production use.
 
-Stream video from any source — files, live cameras, screen recordings — to any browser. No plugins, no WebRTC, no complex setup. Just HTTP.
+Stream video from any source — files, live cameras, screen recordings — to any browser. No plugins, no complex setup. HTTP streaming + MSE playback.
 
 ## Features
 
-- **Works with any video source** — MP4 files, RTSP cameras, Raspberry Pi camera, OBS recordings, or any growing video file
+- **Works with any video source** — MP4 files, RTSP cameras, Raspberry Pi camera, OBS recordings, HTTP streams, or any growing video file
 - **Single FFmpeg, unlimited viewers** — Video processing happens once, then fans out to all clients. 1 viewer or 100, same CPU cost
-- **Browser-native playback** — Uses MJPEG for video (just an `<img>` tag) and Web Audio API for sound
+- **Perfect audio/video sync** — Single muxed stream (H.264 + AAC in fMP4), browser handles sync natively
+- **HTTP streaming + MSE** — fMP4 chunks streamed over HTTP, decoded via MediaSource Extensions for proper audio/video sync
+- **Software encoding (libx264)** — Uses `libx264` with `ultrafast` preset, works on any machine — no GPU or special hardware required
 - **Multiple concurrent clients** — Async architecture handles many viewers without blocking
-- **Zero client setup** — Open URL in any browser, streaming starts immediately
+- **Zero client setup** — Open URL in any modern browser, streaming starts immediately
 - **Adjustable quality** — Single `VIDEO_QUALITY` knob (0–1) controls resolution + compression together
-- **Backpressure handling** — Automatically drops frames for slow clients to prevent memory bloat
-- **Sync monitoring** — Built-in `/stats` endpoint tracks audio/video drift
+- **Backpressure handling** — Automatically drops chunks for slow clients to prevent memory bloat
+- **Monitoring** — Built-in `/stats` endpoint tracks stream health
 
 ## Use cases
 
@@ -24,6 +26,7 @@ Stream video from any source — files, live cameras, screen recordings — to a
 - Raspberry Pi or embedded device streams
 - Internal dashboards and live monitoring
 - Screen sharing within local network
+- Streaming HTTP/HLS video sources to browsers
 - Learning how streaming protocols work
 
 **Not ideal for:**
@@ -36,7 +39,7 @@ Stream video from any source — files, live cameras, screen recordings — to a
 ### Requirements
 
 - Python 3.12+
-- FFmpeg
+- FFmpeg (with libx264 and AAC support)
 
 ```bash
 # macOS
@@ -81,6 +84,9 @@ VIDEO_FILE=video.mp4 uv run server.py
 # RTSP camera (auto-detected as live)
 VIDEO_FILE=rtsp://192.168.1.100:554/stream uv run server.py
 
+# HTTP/HLS stream (auto-detected as live, browser User-Agent sent)
+VIDEO_FILE="https://example.com/live/stream.m3u8" uv run server.py
+
 # Raspberry Pi / USB camera (auto-detected as device)
 VIDEO_FILE=/dev/video0 uv run server.py
 
@@ -103,54 +109,51 @@ VIDEO_FILE="avfoundation:Capture screen 0" uv run server.py
 
 > **Tip (macOS):** Run `ffmpeg -f avfoundation -list_devices true -i ""` to see available device names and indices.
 
-The same server code handles all sources — FFmpeg abstracts the input, server just reads frames and streams them.
+The same server code handles all sources — FFmpeg abstracts the input, server just reads fMP4 chunks and streams them.
 
 ### Stream quality
 
-Use `VIDEO_QUALITY` to control the overall broadcast quality with a single value from `0` to `1`. This adjusts **both** resolution and JPEG compression together — the easiest way to reduce bandwidth.
+Use `VIDEO_QUALITY` to control the overall broadcast quality with a single value from `0` to `1`. This adjusts **both** resolution and H.264 compression (CRF) together.
 
-| Quality | Resolution      | JPEG        | Use case           |
-| ------- | --------------- | ----------- | ------------------ |
-| `1.0`   | 100% (original) | Best (2)    | LAN / best quality |
-| `0.75`  | ~81%            | Good (9)    | Balanced           |
-| `0.5`   | ~63%            | Medium (16) | Remote viewers     |
-| `0.25`  | ~44%            | Low (24)    | Low bandwidth      |
-| `0.0`   | 25%             | Worst (31)  | Minimal bandwidth  |
+| Quality | Resolution      | CRF | Use case           |
+| ------- | --------------- | --- | ------------------ |
+| `1.0`   | 100% (original) | 18  | LAN / best quality |
+| `0.75`  | ~81%            | 24  | Balanced           |
+| `0.5`   | ~63%            | 29  | Remote viewers     |
+| `0.25`  | ~44%            | 35  | Low bandwidth      |
+| `0.0`   | 25%             | 40  | Minimal bandwidth  |
 
 ```bash
-# Best quality (original resolution, best JPEG)
+# Best quality
 VIDEO_QUALITY=1 uv run server.py
 
-# Balanced (good for most cases)
+# Balanced
 VIDEO_QUALITY=0.75 uv run server.py
 
-# Low bandwidth (smaller + more compressed)
+# Low bandwidth
 VIDEO_QUALITY=0.5 uv run server.py
 
 # Works with any source
 VIDEO_QUALITY=0.5 VIDEO_FILE="avfoundation:0" uv run server.py
 ```
 
-For fine-grained control, use `VIDEO_RESOLUTION` and `JPEG_QUALITY` separately instead:
+For fine-grained control, use `VIDEO_RESOLUTION` and `VIDEO_CRF` separately:
 
 ```bash
 # Explicit resolution (e.g., 720p)
 VIDEO_RESOLUTION="1280x720" uv run server.py
 
-# Explicit JPEG compression (2=best, 31=worst)
-JPEG_QUALITY=10 uv run server.py
+# Explicit H.264 CRF (0=lossless, 51=worst, default 23)
+VIDEO_CRF=28 uv run server.py
 ```
-
-If nothing is set, the original source quality is used.
 
 ## API
 
-| Endpoint | Description                                               |
-| -------- | --------------------------------------------------------- |
-| `/`      | Web player with controls (play/pause, volume, fullscreen) |
-| `/live`  | Raw MJPEG stream — embed with `<img src="/live">`         |
-| `/audio` | Raw PCM audio stream (WAV format)                         |
-| `/stats` | JSON stats: clients, frames, sync drift                   |
+| Endpoint  | Description                                               |
+| --------- | --------------------------------------------------------- |
+| `/`       | Web player with controls (play/pause, volume, fullscreen) |
+| `/stream` | HTTP stream — muxed fMP4 (init segment + media chunks)    |
+| `/stats`  | JSON stats: clients, chunks sent, stream health           |
 
 ## How it works
 
@@ -159,47 +162,63 @@ If nothing is set, the original source quality is used.
                                               │
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │ Video Source │────▶│   FFmpeg    │────▶│ Broadcaster │──┼─── Client 2 (browser)
-│ (any input) │     │ (1 process) │     │ (fan-out)   │  │
+│ (any input) │     │ (1 process) │     │   (HTTP)    │  │
 └─────────────┘     └─────────────┘     └─────────────┘  │
-                                              └─── Client N (browser)
+                    H.264 + AAC                └─── Client N (browser)
+                    in fMP4
 ```
 
-1. **FFmpeg** runs as a **single process** — decodes the source, re-encodes to MJPEG frames + PCM audio
-2. **Broadcaster** reads frames from that one process and fans them out to all connected clients
-3. **Each client** gets an async queue — the same frame bytes are pushed to every viewer
-4. **Browser** renders MJPEG in an `<img>` tag, plays audio via Web Audio API
+1. **FFmpeg** decodes any source, re-encodes to H.264 video + AAC audio in fragmented MP4 using `libx264` (software encoding)
+2. **Broadcaster** reads raw fMP4 chunks from FFmpeg's stdout, caches the init segment
+3. **HTTP stream** sends muxed fMP4 bytes to each connected browser client via `/stream`
+4. **Browser** uses `fetch()` to read the HTTP stream and **MSE** (MediaSource Extensions) to decode — audio and video are **synced by the browser** automatically. MSE's `sequence` mode ensures every client starts at time 0 regardless of when they join
+
+### Why this is better than MJPEG + PCM
+
+The previous architecture sent MJPEG frames and raw PCM audio as two separate HTTP streams. This had issues:
+
+|                  | Old (MJPEG + PCM)        | New (HTTP + fMP4)       |
+| ---------------- | ------------------------ | ----------------------- |
+| Connections      | 2 (video + audio)        | 1 (HTTP stream)         |
+| FFmpeg processes | 2 (or FIFO workaround)   | 1                       |
+| A/V sync         | Manual wall-clock pacing | Native browser sync     |
+| Video codec      | MJPEG (10-50x larger)    | H.264 (efficient)       |
+| Audio codec      | Raw PCM (uncompressed)   | AAC (compressed)        |
+| Client code      | Web Audio API + img tag  | MSE + `<video>` element |
+
+### Software encoding (libx264)
+
+The server uses `libx264` software encoding with the `ultrafast` preset and `zerolatency` tune. This works on **any machine** — no GPU, no special drivers, no platform-specific setup. Just install FFmpeg and go.
+
+- **Baseline profile** — maximum browser compatibility (every browser supports it)
+- **`ultrafast` preset** — minimal CPU usage, prioritizes speed over compression efficiency
+- **`zerolatency` tune** — eliminates encoding latency for real-time streaming
+- **CRF-based quality** — controllable via `VIDEO_QUALITY` or `VIDEO_CRF`
 
 ### One FFmpeg, many clients
 
-The expensive work — decoding, scaling, JPEG compression — happens **once**, regardless of how many clients are watching. Whether 1 viewer or 100, there is still only one FFmpeg process running.
+The expensive work — decoding, H.264 encoding, AAC encoding — happens **once**, regardless of how many clients are watching.
 
 ```
 Processing cost:  O(1)  — fixed, doesn't grow with clients
-Network cost:     O(n)  — each client gets a copy of the frame bytes
+Network cost:     O(n)  — each client gets a copy of the chunk bytes
 ```
 
-Adding more viewers only increases network I/O (sending the same bytes to each connection), which is cheap. The CPU-heavy video processing never duplicates. This is the core advantage of the broadcast architecture.
+If a client falls behind (slow connection), the server drops chunks for that client via backpressure — without affecting other viewers or the FFmpeg pipeline.
 
-If a client falls behind (slow connection), the server drops frames for that client via backpressure — without affecting other viewers or the FFmpeg pipeline.
+### Why HTTP + MSE (not raw `<video src>`)?
 
-### Why HTTP instead of WebRTC?
+The server sends a continuous HTTP response with `Content-Type: video/mp4` and no `Content-Length`. The client uses `fetch()` to read this stream and feeds raw bytes into a MediaSource Extensions (MSE) SourceBuffer.
 
-This is a **broadcast model** — server sends to clients, not peer-to-peer.
+Why not just `<video src="/stream">`? Because the browser's native MP4 parser can't handle joining a live fMP4 stream mid-way — it expects timestamps to start at 0. MSE in `sequence` mode remaps timestamps automatically, so every client starts at 0 regardless of when they connect. MSE also handles audio decoding properly for streaming fMP4.
 
-|           | HTTP (this project)       | WebRTC                     |
-| --------- | ------------------------- | -------------------------- |
-| Direction | One-way (server → client) | Two-way                    |
-| Latency   | 1-3 seconds               | < 150ms                    |
-| Setup     | Open URL                  | STUN/TURN, ICE negotiation |
-| Use case  | Watching streams          | Video calls                |
-
-For one-way broadcast where slight delay is acceptable, HTTP is simpler and works everywhere.
+The MSE code is minimal (~80 lines) — just `fetch` + `appendBuffer` in a loop. No WebSocket, no complex state management.
 
 ### Why ASGI?
 
 Traditional WSGI (Flask, Django) uses one thread per request. For streaming, connections stay open for minutes or hours — you'd run out of threads fast.
 
-ASGI with asyncio lets thousands of connections share a single thread. While one client waits for the next frame, others can receive data. Essential for long-lived streaming connections.
+ASGI with asyncio lets thousands of connections share a single thread. While one client waits for the next chunk, others can receive data. Essential for long-lived streaming connections.
 
 ## Configuration
 
@@ -209,9 +228,10 @@ Environment variables:
 | ------------------ | ------------ | ------------------------------------------------------------------------ |
 | `VIDEO_FILE`       | `video.mp4`  | Path to video file, device, or stream URL                                |
 | `VIDEO_FPS`        | `30`         | Output frame rate                                                        |
-| `VIDEO_QUALITY`    | *(none)*     | Overall quality 0–1 (1=best). Controls resolution + JPEG together        |
+| `VIDEO_QUALITY`    | *(none)*     | Overall quality 0–1 (1=best). Controls CRF + resolution together         |
+| `VIDEO_CRF`        | `23`         | H.264 CRF 0–51, lower=better (ignored if `VIDEO_QUALITY` is set)         |
 | `VIDEO_RESOLUTION` | *(original)* | Explicit resolution, e.g. `1280x720` (ignored if `VIDEO_QUALITY` is set) |
-| `JPEG_QUALITY`     | `5`          | MJPEG quality 2–31, lower=better (ignored if `VIDEO_QUALITY` is set)     |
+| `AUDIO_BITRATE`    | `128k`       | AAC audio bitrate                                                        |
 | `GROWING_FILE`     | `false`      | Set to `1` for files being actively written (e.g., OBS)                  |
 | `HOST`             | `0.0.0.0`    | Server bind address                                                      |
 | `PORT`             | `8000`       | Server port                                                              |
@@ -220,45 +240,42 @@ Environment variables:
 ## Project structure
 
 ```
-├── main.py              # ASGI application entry point
+├── main.py              # ASGI application entry point + routing
 ├── server.py            # Uvicorn runner + graceful shutdown
 ├── lib/
 │   ├── config.py        # Configuration + source type detection
-│   ├── wav.py           # WAV header generation for audio
-│   └── templates.py     # HTML/JS web player
+│   └── templates.py     # HTML/JS web player (MSE + fetch)
 └── services/
-    ├── broadcaster.py   # FFmpeg process management
-    ├── connection.py    # Client queue + backpressure
-    └── handlers.py      # HTTP endpoint handlers
+    ├── broadcaster.py   # FFmpeg process management (fMP4 output, libx264)
+    ├── connection.py    # Client queue + backpressure + init segment cache
+    └── handlers.py      # HTTP stream + web endpoint handlers
 ```
 
 ## Key insights
 
-### HTTP is a streaming protocol
+### Muxed streaming beats split streams
 
-Most people think HTTP = request → response → close. But streaming shows HTTP can be a continuous transport channel:
-
-1. Open connection once
-2. Keep sending data forever
-3. Client keeps rendering
-
-**Streaming isn't a special protocol — it's controlled buffering over long-lived HTTP connections.** This is the same principle behind Server-Sent Events, HTTP/2 push, and chunked transfer encoding.
+Sending audio and video as separate streams means you have to synchronize them yourself — and getting that right is hard. By muxing them into a single fMP4 container, the browser's media pipeline handles sync natively. One connection, one FFmpeg process, zero sync code.
 
 ### Process once, deliver many
 
-The most common mistake in building a streaming server is spawning a new FFmpeg process per client. That means if 50 people watch, you decode and re-encode the video 50 times — destroying CPU and memory.
+The most common mistake in building a streaming server is spawning a new FFmpeg process per client. That means if 50 people watch, you decode and re-encode the video 50 times.
 
-This server runs **one FFmpeg process total**. The broadcaster reads from that single pipe and copies the frame bytes into each client's queue. The heavy work (decode → scale → compress) happens once. Only the lightweight part (copying bytes to N sockets) scales with viewers.
+This server runs **one FFmpeg process total**. The broadcaster reads from that single pipe and copies the chunk bytes into each client's queue. The heavy work (decode → encode → mux) happens once.
 
 ```
 50 clients, naive approach:    50 × FFmpeg = 50× CPU
 50 clients, this server:        1 × FFmpeg = 1× CPU
 ```
 
+### The init segment pattern
+
+Fragmented MP4 has a crucial property: the **init segment** (containing `ftyp` and `moov` atoms) describes the stream format but contains no media data. It must be sent to each client **before** any media chunks. The server caches this init segment and sends it to every new HTTP streaming client on connect. After that, only media chunks (containing `moof` and `mdat` atoms) are streamed.
+
 ## Known limitations
 
-- Audio may drift out of sync over long sessions (monitor via `/stats`)
-- No seeking or pause (it's live, not VOD)
+- **Requires modern browser** — MSE support needed (Chrome 23+, Firefox 42+, Safari 8+, Edge 12+)
+- No seeking (it's live, not VOD)
 - Not tested beyond ~10 concurrent clients
 - No HTTPS (add via reverse proxy like nginx)
 - **macOS camera/microphone**: Requires granting permissions to Terminal in System Settings > Privacy & Security

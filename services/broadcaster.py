@@ -1,11 +1,12 @@
 """
 Media broadcasting service.
-Handles video and audio extraction from source files using ffmpeg.
+Single FFmpeg process outputs fragmented MP4 (H.264 + AAC) to stdout.
+Chunks are broadcast to all HTTP streaming clients via the connection manager.
 """
 
 import asyncio
 import atexit
-import logging  
+import logging
 import os
 import signal
 import sys
@@ -27,7 +28,7 @@ _ffmpeg_pids: Set[int] = set()
 def _cleanup_ffmpeg_processes():
     """Kill any remaining FFmpeg processes on exit.
     
-    This is a safety net — catches orphaned FFmpeg processes that weren't
+    Safety net — catches orphaned FFmpeg processes that weren't
     cleaned up by the normal shutdown path (e.g., Ctrl+C during reload).
     """
     for pid in list(_ffmpeg_pids):
@@ -68,51 +69,27 @@ class BroadcasterState(Enum):
 
 
 @dataclass
-class FrameData:
-    """Container for a video frame with timestamp for sync."""
-    jpeg_data: bytes
-    timestamp: float = field(default_factory=time.time)
-    frame_number: int = 0
-
-
-@dataclass
 class StreamStats:
-    """Statistics for stream synchronization using wall-clock time."""
+    """Statistics for the fMP4 broadcast stream."""
     start_time: float = field(default_factory=time.time)
-    video_frames: int = 0
-    audio_chunks: int = 0
-    # Track bytes sent for accurate audio timestamp
-    audio_bytes_sent: int = 0
+    chunks_sent: int = 0
+    bytes_sent: int = 0
     
     @property
     def elapsed(self) -> float:
         return time.time() - self.start_time
-    
-    def video_timestamp(self) -> float:
-        """Get video position based on frame count and FPS."""
-        return self.video_frames / config.video.fps
-    
-    def audio_timestamp(self) -> float:
-        """Get audio position based on actual bytes sent."""
-        bytes_per_second = (
-            config.audio.sample_rate *
-            config.audio.channels *
-            config.audio.bytes_per_sample
-        )
-        if bytes_per_second == 0:
-            return 0.0
-        return self.audio_bytes_sent / bytes_per_second
 
 
 class MediaBroadcaster:
     """
-    Singleton service that broadcasts video and audio streams.
+    Singleton service that broadcasts video+audio as fragmented MP4.
     
-    Features:
-    - Single ffmpeg process for video, single for audio (synced by timing)
-    - Efficient frame parsing and distribution
-    - Automatic reconnection on failure
-    - Graceful shutdown handling
+    Architecture:
+    - Single FFmpeg process for ALL source types
+    - Outputs fMP4 (H.264 + AAC) to stdout
+    - Reads raw byte chunks and broadcasts to all HTTP streaming clients
+    - Init segment (moov atom) cached for new client initialization
+    - Browser plays via MSE + fetch — perfect A/V sync
     """
     
     _instance: Optional["MediaBroadcaster"] = None
@@ -128,17 +105,13 @@ class MediaBroadcaster:
             return
             
         self._video_config = config.video
-        self._audio_config = config.audio
         
         self._state = BroadcasterState.STOPPED
         self._task: Optional[asyncio.Task] = None
-        self._video_process: Optional[asyncio.subprocess.Process] = None
-        self._audio_process: Optional[asyncio.subprocess.Process] = None
+        self._process: Optional[asyncio.subprocess.Process] = None
         
-        self._current_frame: Optional[bytes] = None
         self._shutdown_event = asyncio.Event()
         self._stats = StreamStats()
-        
         self._initialized = True
         logger.info("MediaBroadcaster initialized")
     
@@ -149,10 +122,6 @@ class MediaBroadcaster:
     @property
     def state(self) -> BroadcasterState:
         return self._state
-    
-    @property
-    def current_frame(self) -> Optional[bytes]:
-        return self._current_frame
     
     @property
     def is_running(self) -> bool:
@@ -173,15 +142,16 @@ class MediaBroadcaster:
             # Build quality info string
             if self._video_config.quality is not None:
                 q = self._video_config.quality
+                scale = self._video_config.effective_scale
                 quality_info = (
                     f"quality: {q} "
-                    f"(scale: {self._video_config.effective_scale:.0%}, "
-                    f"jpeg: {self._video_config.effective_jpeg_quality})"
+                    f"(CRF: {self._video_config.effective_crf}"
+                    f"{f', scale: {scale:.0%}' if scale and scale < 1.0 else ''})"
                 )
             elif self._video_config.resolution:
-                quality_info = f"resolution: {self._video_config.resolution}"
+                quality_info = f"resolution: {self._video_config.resolution}, CRF: {self._video_config.crf}"
             else:
-                quality_info = "quality: original"
+                quality_info = f"CRF: {self._video_config.crf}"
             
             logger.info(
                 f"Broadcaster started - source: {self._video_config.file_path} "
@@ -203,8 +173,8 @@ class MediaBroadcaster:
         self._state = BroadcasterState.STOPPING
         self._shutdown_event.set()
         
-        # Kill processes
-        await self._kill_processes()
+        # Kill FFmpeg process
+        await self._kill_process()
         
         # Wait for task to complete
         if self._task and not self._task.done():
@@ -217,372 +187,301 @@ class MediaBroadcaster:
         self._state = BroadcasterState.STOPPED
         logger.info("Broadcaster stopped")
     
-    async def _kill_processes(self) -> None:
-        """Terminate all ffmpeg processes. Uses SIGKILL for reliability."""
-        for name, process in [("video", self._video_process), ("audio", self._audio_process)]:
-            if process and process.returncode is None:
-                pid = process.pid
+    async def _kill_process(self) -> None:
+        """Terminate the FFmpeg process. Uses SIGKILL for reliability."""
+        if self._process and self._process.returncode is None:
+            pid = self._process.pid
+            try:
+                self._process.kill()
                 try:
-                    # Send SIGKILL directly — FFmpeg with device capture
-                    # (avfoundation) often ignores SIGTERM
-                    process.kill()
+                    await asyncio.wait_for(self._process.wait(), timeout=3.0)
+                    logger.debug(f"FFmpeg process killed (PID {pid})")
+                except asyncio.TimeoutError:
+                    logger.warning(f"FFmpeg PID {pid} didn't die, force killing via OS")
                     try:
-                        await asyncio.wait_for(process.wait(), timeout=3.0)
-                        logger.debug(f"{name} process killed (PID {pid})")
-                    except asyncio.TimeoutError:
-                        # Last resort: os.kill
-                        logger.warning(f"{name} PID {pid} didn't die, force killing via OS")
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except (ProcessLookupError, OSError):
-                            pass
-                except ProcessLookupError:
-                    pass
-                except Exception as e:
-                    logger.debug(f"Error stopping {name} process: {e}")
-                finally:
-                    _ffmpeg_pids.discard(pid)
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                logger.debug(f"Error stopping FFmpeg process: {e}")
+            finally:
+                _ffmpeg_pids.discard(pid)
         
-        self._video_process = None
-        self._audio_process = None
+        self._process = None
     
     async def _broadcast_loop(self) -> None:
-        """Main broadcast loop that manages ffmpeg processes."""
+        """Main broadcast loop that manages the FFmpeg process."""
         self._state = BroadcasterState.RUNNING
+        restart_delay = 1.0  # Exponential backoff for restarts
         
         while not self._shutdown_event.is_set():
             try:
+                cycle_start = time.time()
                 await self._run_broadcast_cycle()
+                cycle_duration = time.time() - cycle_start
+                
+                # If cycle lasted a reasonable time, reset backoff
+                if cycle_duration > 10:
+                    restart_delay = 1.0
+                else:
+                    # Short cycle = FFmpeg failed quickly, increase backoff
+                    logger.warning(f"FFmpeg exited after {cycle_duration:.1f}s, restarting in {restart_delay:.0f}s...")
+                    await asyncio.sleep(restart_delay)
+                    restart_delay = min(restart_delay * 2, 30.0)
+                    
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Broadcast cycle error: {e}")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(restart_delay)
+                restart_delay = min(restart_delay * 2, 30.0)
         
         self._state = BroadcasterState.STOPPED
     
     async def _run_broadcast_cycle(self) -> None:
-        """Run one cycle of broadcasting (until error or shutdown)."""
-        # Reset stats for new cycle
+        """Run one broadcast cycle: start FFmpeg, read chunks, broadcast."""
         self._stats = StreamStats()
         
-        # Start ffmpeg processes
-        self._video_process = await self._create_video_process()
-        
-        # For device sources (cameras), audio may not be available
-        # Only create audio process for file/stream sources
-        has_audio = not self._video_config.is_live_source or self._has_audio_stream()
-        if has_audio:
-            self._audio_process = await self._create_audio_process()
-        else:
-            self._audio_process = None
-            if not hasattr(self, '_audio_disabled_logged'):
-                logger.info("Audio disabled for video-only device source")
-                self._audio_disabled_logged = True
-        
-        # Shared clock for both streams — set AFTER both processes are created
-        loop = asyncio.get_event_loop()
-        stream_start = loop.time()
+        self._process = await self._create_ffmpeg_process()
+        pid = self._process.pid
         
         try:
-            # Run video reader (always)
-            video_task = asyncio.create_task(
-                self._read_video_frames(self._video_process, stream_start)
-            )
-            
-            tasks = [video_task]
-            
-            # Add audio reader if available
-            if self._audio_process:
-                audio_task = asyncio.create_task(
-                    self._read_audio_chunks(self._audio_process, stream_start)
-                )
-                tasks.append(audio_task)
-            
-            # Wait for video to complete (audio ending won't stop video)
-            # For video-only sources, just wait for video
-            if len(tasks) == 1:
-                await video_task
-            else:
-                # Wait for video to finish; if audio ends first, keep video running
-                done, pending = await asyncio.wait(
-                    tasks,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                
-                # If video task completed, cancel audio
-                # If audio task completed first, let video continue
-                if video_task in done:
-                    for task in pending:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
-                else:
-                    # Audio ended but video still running - wait for video
-                    logger.debug("Audio stream ended, video continuing")
-                    await video_task
-                    
+            await self._read_and_broadcast(self._process)
         finally:
-            await self._kill_processes()
+            rc = self._process.returncode if self._process else None
+            if rc is not None and rc != 0 and rc != -9:  # -9 = SIGKILL (normal shutdown)
+                logger.warning(f"FFmpeg (PID {pid}) exited with code {rc}")
+            await self._kill_process()
     
-    def _has_audio_stream(self) -> bool:
-        """Check if source likely has audio. Conservative - returns True for files/streams."""
-        source_type = self._video_config.source_type
-        
-        # Files and streams usually have audio
-        if source_type in (SourceType.FILE, SourceType.LIVE_STREAM, SourceType.GROWING_FILE):
-            return True
-        
-        # Devices (cameras) usually don't have embedded audio
-        # User can override by setting VIDEO_FILE to include audio device
-        # e.g., "avfoundation:0:1" for video device 0 + audio device 1
-        path = self._video_config.file_path
-        if path.startswith("avfoundation:") and ":" in path.split("avfoundation:", 1)[1]:
-            # Has format "avfoundation:video:audio" - audio specified
-            return True
-        
-        return False
-    
-    def _build_input_args(self, audio_only: bool = False) -> list[str]:
-        """
-        Build FFmpeg input arguments based on source type.
-        
-        Args:
-            audio_only: If True, build args for audio-only capture (used for 
-                       avfoundation where video and audio need separate processes)
-        """
+    def _build_input_args(self) -> list[str]:
+        """Build FFmpeg input arguments based on source type."""
         args = []
         source_type = self._video_config.source_type
         path = self._video_config.file_path
         
-        # Add pacing flag only for files (live sources are already real-time)
+        # Add pacing flag to match real-time playback speed.
+        # Without -re, FFmpeg processes as fast as possible — for remote HTTP
+        # files this means 3-5x real-time, causing all clients to desync.
+        # Only skip -re for truly live sources (RTSP, devices) that already
+        # produce data at real-time.
         if not self._video_config.is_live_source:
             args.extend(["-re"])
+        elif path.lower().startswith(("http://", "https://")):
+            # Remote HTTP video files download faster than real-time
+            # and need pacing to prevent fast-forward and FFmpeg restart storms
+            args.extend(["-re"])
         
-        # Add looping only for regular files
+        # Loop for regular files and remote HTTP video files
+        # This prevents FFmpeg from exiting and restarting (which resets position)
         if self._video_config.can_loop:
+            args.extend(["-stream_loop", "-1"])
+        elif path.lower().startswith(("http://", "https://")):
             args.extend(["-stream_loop", "-1"])
         
         # Add format specifier and options for devices
         if source_type == SourceType.DEVICE:
             if path.startswith("avfoundation:"):
                 args.extend(["-f", "avfoundation"])
-                
-                # Extract device spec from "avfoundation:X" or "avfoundation:X:Y"
+                # For avfoundation, pass the device spec after the colon
                 device_spec = path.split(":", 1)[1]
-                
-                # Check if both video and audio devices specified (e.g., "0:1")
-                if ":" in device_spec:
-                    video_dev, audio_dev = device_spec.split(":", 1)
-                    if audio_only:
-                        # Audio-only: use ":audio_dev" format
-                        path = f":{audio_dev}"
-                    else:
-                        # Video-only: use "video_dev" format  
-                        path = video_dev
-                else:
-                    # Single device (video only)
-                    path = device_spec
-                
-                # Don't force framerate — let FFmpeg auto-negotiate with device
-                # Some devices (e.g., OBS Virtual Camera) only support specific rates
+                path = device_spec
                         
             elif path.startswith("/dev/video"):
                 args.extend(["-f", "v4l2"])
-                # v4l2 also benefits from explicit framerate
-                if not audio_only:
-                    args.extend(["-framerate", str(self._video_config.fps)])
+                args.extend(["-framerate", str(self._video_config.fps)])
         
         # Add RTSP transport options for reliability
         if source_type == SourceType.LIVE_STREAM and path.lower().startswith("rtsp://"):
             args.extend(["-rtsp_transport", "tcp"])
         
-        # Set browser User-Agent for HTTP/HTTPS sources to avoid being blocked
+        # HTTP/HTTPS source options: User-Agent and reconnect resilience
         if source_type == SourceType.LIVE_STREAM and path.lower().startswith(("http://", "https://")):
             args.extend([
                 "-user_agent",
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
             ])
         
         args.extend(["-i", path])
         return args
     
-    async def _create_video_process(self) -> asyncio.subprocess.Process:
-        """Create ffmpeg process for video extraction."""
-        input_args = self._build_input_args()
-        
-        # Build scale filter — VIDEO_QUALITY (0-1) takes priority over VIDEO_RESOLUTION
-        output_args = []
+    def _build_video_filter_args(self) -> list[str]:
+        """Build FFmpeg video filter args for scaling."""
+        args = []
         scale = self._video_config.effective_scale
         if scale is not None and scale < 1.0:
-            # Scale by factor, keep dimensions divisible by 2
-            # trunc(iw*s/2)*2 rounds down to nearest even number
-            output_args.extend([
+            args.extend([
                 "-vf",
                 f"scale=trunc(iw*{scale:.4f}/2)*2:trunc(ih*{scale:.4f}/2)*2"
             ])
-            logger.info(f"Video scaled to {scale:.0%} (quality={self._video_config.quality})")
         elif self._video_config.resolution:
-            # Explicit resolution (e.g., "1280x720")
             try:
                 w, h = self._video_config.resolution.lower().split("x")
-                output_args.extend(["-vf", f"scale={w}:{h}"])
-                logger.info(f"Video resolution set to {w}x{h}")
+                args.extend(["-vf", f"scale={w}:{h}"])
             except ValueError:
                 logger.warning(f"Invalid VIDEO_RESOLUTION '{self._video_config.resolution}', using original")
+        return args
+    
+    async def _create_ffmpeg_process(self) -> asyncio.subprocess.Process:
+        """Create single FFmpeg process outputting fragmented MP4.
         
-        # Use effective JPEG quality (derived from VIDEO_QUALITY or JPEG_QUALITY)
-        jpeg_q = self._video_config.effective_jpeg_quality
+        Output format: fMP4 with H.264 video + AAC audio
+        - empty_moov: init segment at the start (no seek needed)
+        - frag_keyframe: new fragment at each keyframe
+        - default_base_moof: required for browser compatibility
+        
+        Uses libx264 software encoding (ultrafast preset) for maximum
+        compatibility across all platforms.
+        """
+        input_args = self._build_input_args()
+        video_filter_args = self._build_video_filter_args()
+        crf = self._video_config.effective_crf
+        fps = self._video_config.fps
+        audio_bitrate = self._video_config.audio_bitrate
+        
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            *input_args,
+            # Video: H.264 Baseline profile for widest browser support
+            # - level 3.1 supports up to 1080p@30fps (level 3.0 caps at 720p)
+            # - yuv420p pixel format required by all mobile decoders
+            *video_filter_args,
+            "-c:v", "libx264",
+            "-profile:v", "baseline",
+            "-level", "3.1",
+            "-pix_fmt", "yuv420p",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-crf", str(crf),
+            "-g", str(fps),      # Keyframe every 1 second
+            "-r", str(fps),
+            # Audio: AAC-LC stereo 44.1kHz (browser-compatible)
+            "-c:a", "aac",
+            "-ac", "2",
+            "-ar", "44100",
+            "-b:a", audio_bitrate,
+            # Output: fragmented MP4 to stdout
+            "-f", "mp4",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-frag_duration", "500000",  # Fragment every 500ms for smooth streaming
+            "pipe:1",
+        ]
         
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            *input_args,
-            *output_args,
-            "-f", "image2pipe",
-            "-vcodec", "mjpeg",
-            "-q:v", str(jpeg_q),
-            "-r", str(self._video_config.fps),
-            "-",
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,  # Capture stderr for logging
             preexec_fn=_make_child_die_with_parent,
         )
         _ffmpeg_pids.add(process.pid)
-        logger.debug(f"Video FFmpeg started (PID {process.pid}, q:v={jpeg_q})")
+        
+        # Start background task to log FFmpeg stderr
+        asyncio.create_task(self._log_ffmpeg_stderr(process))
+        
+        logger.info(f"FFmpeg started (PID {process.pid}) — fMP4 output (H.264 CRF={crf}, AAC {audio_bitrate})")
         return process
     
-    async def _create_audio_process(self) -> asyncio.subprocess.Process:
-        """Create ffmpeg process for audio extraction."""
-        # For avfoundation with separate audio device, use audio_only mode
-        # This makes the input "-i :audio_device" instead of "-i video:audio"
-        is_avfoundation_with_audio = (
-            self._video_config.source_type == SourceType.DEVICE and
-            self._video_config.file_path.startswith("avfoundation:") and
-            ":" in self._video_config.file_path.split("avfoundation:", 1)[1]
-        )
-        
-        input_args = self._build_input_args(audio_only=is_avfoundation_with_audio)
-        
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            *input_args,
-            "-vn",                          # No video
-            "-acodec", "pcm_s16le",
-            "-ar", str(self._audio_config.sample_rate),
-            "-ac", str(self._audio_config.channels),
-            "-f", "s16le",
-            "-",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            preexec_fn=_make_child_die_with_parent,
-        )
-        _ffmpeg_pids.add(process.pid)
-        logger.debug(f"Audio FFmpeg started (PID {process.pid})")
-        return process
+    async def _log_ffmpeg_stderr(self, process: asyncio.subprocess.Process) -> None:
+        """Read and log FFmpeg stderr output for diagnostics."""
+        try:
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if not text:
+                    continue
+                # Log errors/warnings prominently, other lines as debug
+                lower = text.lower()
+                if any(w in lower for w in ("error", "fatal", "failed", "invalid")):
+                    logger.error(f"FFmpeg: {text}")
+                elif "warning" in lower:
+                    logger.warning(f"FFmpeg: {text}")
+                else:
+                    logger.debug(f"FFmpeg: {text}")
+        except (asyncio.CancelledError, Exception):
+            pass
     
-    async def _read_video_frames(self, process: asyncio.subprocess.Process, stream_start: float) -> None:
-        """Read and broadcast video frames from ffmpeg, clock-synced."""
-        buffer = b""
-        frame_interval = 1 / self._video_config.fps
-        loop = asyncio.get_event_loop()
+    @staticmethod
+    def _find_init_end(data: bytes) -> int:
+        """Find the byte offset where the init segment ends.
+        
+        Walks MP4 top-level boxes (ftyp, moov, free, skip) and returns
+        the position of the first non-init box (typically moof).
+        Returns -1 if we haven't received enough data yet.
+        """
+        pos = 0
+        while pos + 8 <= len(data):
+            box_size = int.from_bytes(data[pos:pos + 4], 'big')
+            box_type = data[pos + 4:pos + 8]
+            
+            if box_size < 8:
+                return -1  # Invalid box, need more data
+            
+            # Init boxes: ftyp, moov, free, skip
+            if box_type in (b'ftyp', b'moov', b'free', b'skip'):
+                pos += box_size
+            else:
+                # First non-init box found (moof, mdat, etc.)
+                return pos
+        
+        return -1  # Need more data
+    
+    async def _read_and_broadcast(self, process: asyncio.subprocess.Process) -> None:
+        """Read fMP4 from FFmpeg and broadcast to all clients.
+        
+        Two phases:
+        1. Init: accumulate bytes until ftyp+moov are captured, cache as init segment
+        2. Media: stream raw bytes directly to clients — the browser's MSE
+           SourceBuffer in 'sequence' mode reassembles MP4 boxes internally.
+        
+        Streaming raw bytes (instead of accumulating complete segments) eliminates
+        server-side buffering delay and ensures continuous data delivery. Combined
+        with 'sequence' mode on the client, this is immune to timestamp resets
+        when the source video loops (-stream_loop -1).
+        """
+        init_captured = False
+        init_buf = b""
         
         while not self._shutdown_event.is_set():
-            # Read chunk from ffmpeg
             try:
-                chunk = await process.stdout.read(65536)
+                chunk = await process.stdout.read(16384)  # 16KB for frequent delivery
                 if not chunk:
                     break
             except (Exception, asyncio.CancelledError):
                 break
             
-            buffer += chunk
+            # Phase 1: Capture the init segment (ftyp + moov)
+            if not init_captured:
+                init_buf += chunk
+                init_end = self._find_init_end(init_buf)
+                
+                if init_end > 0:
+                    # Init segment is complete — cache it for new clients
+                    connection_manager.set_init_segment(init_buf[:init_end])
+                    logger.info(f"Init segment captured ({init_end} bytes)")
+                    init_captured = True
+                    
+                    # Any leftover bytes after init are media data — send them
+                    leftover = init_buf[init_end:]
+                    if leftover:
+                        self._stats.chunks_sent += 1
+                        self._stats.bytes_sent += len(leftover)
+                        connection_manager.broadcast(leftover)
+                    init_buf = b""  # Free memory
+                continue
             
-            # Parse JPEG frames from buffer
-            while True:
-                # Find JPEG start marker (FFD8)
-                start = buffer.find(b'\xff\xd8')
-                if start == -1:
-                    buffer = b""
-                    break
-                
-                # Find JPEG end marker (FFD9)
-                end = buffer.find(b'\xff\xd9', start + 2)
-                if end == -1:
-                    buffer = buffer[start:]
-                    break
-                
-                # Extract complete JPEG
-                jpeg_data = buffer[start:end + 2]
-                buffer = buffer[end + 2:]
-                
-                # Track frame count for sync
-                self._stats.video_frames += 1
-                timestamp = self._stats.video_timestamp()
-                
-                # Build MJPEG frame with timestamp header
-                mjpeg_frame = (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    b"Content-Length: " + str(len(jpeg_data)).encode() + b"\r\n"
-                    b"X-Timestamp: " + f"{timestamp:.3f}".encode() + b"\r\n\r\n"
-                    + jpeg_data + b"\r\n"
-                )
-                
-                # Store and broadcast
-                self._current_frame = mjpeg_frame
-                connection_manager.broadcast_video(mjpeg_frame)
-                
-                # Clock-based rate limiting: sleep until we should show this frame
-                expected_time = self._stats.video_frames * frame_interval
-                actual_elapsed = loop.time() - stream_start
-                drift = actual_elapsed - expected_time
-                
-                if drift < -0.001:
-                    await asyncio.sleep(-drift)
-    
-    async def _read_audio_chunks(self, process: asyncio.subprocess.Process, stream_start: float) -> None:
-        """Read and broadcast audio chunks from ffmpeg, paced to match video."""
-        # Calculate chunk size for one video frame duration of audio
-        frame_interval = 1 / self._video_config.fps
-        chunk_size = int(
-            self._audio_config.sample_rate *
-            self._audio_config.channels *
-            self._audio_config.bytes_per_sample *
-            frame_interval
-        )
-        
-        loop = asyncio.get_event_loop()
-        
-        while not self._shutdown_event.is_set():
-            chunk_start = loop.time()
-            
-            try:
-                audio_data = await process.stdout.read(chunk_size)
-                if not audio_data:
-                    break
-                
-                # Track audio chunks and bytes for sync monitoring
-                self._stats.audio_chunks += 1
-                self._stats.audio_bytes_sent += len(audio_data)
-                
-                connection_manager.broadcast_audio(audio_data)
-                
-                # Pace audio to match real-time playback
-                # Calculate where we should be vs where we are
-                expected_time = self._stats.audio_chunks * frame_interval
-                actual_elapsed = loop.time() - stream_start
-                drift = actual_elapsed - expected_time
-                
-                # If we're ahead (read faster than real-time), sleep to sync
-                if drift < -0.001:
-                    await asyncio.sleep(-drift)
-                
-            except (Exception, asyncio.CancelledError):
-                break
+            # Phase 2: Stream raw bytes — SourceBuffer (sequence mode) handles parsing
+            self._stats.chunks_sent += 1
+            self._stats.bytes_sent += len(chunk)
+            connection_manager.broadcast(chunk)
 
 
 # Global broadcaster instance

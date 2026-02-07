@@ -237,13 +237,13 @@ def get_player_html() -> str:
         </header>
         
         <div class="player-wrapper">
-            <img id="video" alt="" />
+            <video id="video" playsinline muted></video>
             
             <div class="overlay" id="overlay">
-                <button class="overlay-btn" onclick="togglePlay()">
+                <button class="overlay-btn" onclick="startStream()">
                     <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                 </button>
-                <div class="overlay-text">Click to start stream</div>
+                <div class="overlay-text" id="overlayText">Click to start stream</div>
             </div>
             
             <div class="controls">
@@ -253,8 +253,8 @@ def get_player_html() -> str:
                 </button>
                 
                 <button class="btn" onclick="toggleMute()">
-                    <svg id="volumeIcon" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
-                    <svg id="muteIcon" viewBox="0 0 24 24" style="display:none"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+                    <svg id="volumeIcon" viewBox="0 0 24 24" style="display:none"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+                    <svg id="muteIcon" viewBox="0 0 24 24"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
                 </button>
                 
                 <div class="volume-wrapper">
@@ -277,38 +277,255 @@ def get_player_html() -> str:
     
     <script>
         const HIDE_DELAY = 3000;
-        let audioCtx = null, gainNode = null, isPlaying = false, isMuted = false;
-        let abortCtrl = null, volume = 70, hideTimeout = null;
+        
+        let isStreaming = false;
+        let isMuted = true;
+        let volume = 70;
+        let hideTimeout = null;
+        let streamReader = null;
+        
+        // Web Audio API — explicit audio rendering from the video element.
+        // createMediaElementSource() routes audio exclusively through AudioContext,
+        // giving us reliable audio output + volume control via GainNode.
+        let audioCtx = null;
+        let gainNode = null;
         
         const $ = id => document.getElementById(id);
         const $$ = sel => document.querySelector(sel);
+        const video = $('video');
+        
+        // ── Audio Context Setup ─────────────────────────────────────
+        // Must be called once. Captures the <video> element's audio output
+        // and routes it through AudioContext → GainNode → speakers.
+        
+        function setupAudio() {
+            if (audioCtx) return;
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioCtx.createMediaElementSource(video);
+                gainNode = audioCtx.createGain();
+                source.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                gainNode.gain.value = 0; // Start silent (muted)
+            } catch(e) {
+                console.error('Audio setup failed:', e);
+            }
+        }
+        
+        function resumeAudio() {
+            if (audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+        
+        // ── Stream Control (MSE + HTTP fetch) ───────────────────────
+        // Fetches fMP4 from /stream over HTTP, decodes via MediaSource Extensions.
+        // MSE handles audio/video sync and codec decoding natively.
+        // Single fetch() call — no WebSocket, no reconnection logic.
+        
+        async function startStream() {
+            if (isStreaming) return;
+            isStreaming = true;
+            setStatus('connecting', 'Connecting...');
+            updateUI();
+            
+            const ms = new MediaSource();
+            ms.addEventListener('sourceopen', async () => {
+                // Configure SourceBuffer for H.264 Baseline + AAC-LC
+                const codecs = [
+                    'video/mp4; codecs="avc1.42C01E,mp4a.40.2"',
+                    'video/mp4; codecs="avc1.42C01E"',
+                ];
+                let sb;
+                for (const c of codecs) {
+                    if (MediaSource.isTypeSupported(c)) {
+                        try { sb = ms.addSourceBuffer(c); break; } catch(e) {}
+                    }
+                }
+                if (!sb) {
+                    setStatus('disconnected', 'Unsupported codec');
+                    isStreaming = false;
+                    updateUI();
+                    return;
+                }
+                sb.mode = 'sequence';
+                
+                try {
+                    const res = await fetch('/stream');
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    
+                    streamReader = res.body.getReader();
+                    video.play().catch(() => {
+                        $('overlayText').textContent = 'Click to play';
+                    });
+                    
+                    let appends = 0;
+                    while (true) {
+                        const {done, value} = await streamReader.read();
+                        if (done) break;
+                        
+                        // Wait for SourceBuffer if busy
+                        if (sb.updating) {
+                            await new Promise(r => sb.addEventListener('updateend', r, {once: true}));
+                        }
+                        
+                        try {
+                            sb.appendBuffer(value);
+                        } catch (e) {
+                            if (e.name === 'QuotaExceededError') {
+                                // Buffer full — trim and retry
+                                if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, {once: true}));
+                                if (sb.buffered.length > 0) {
+                                    sb.remove(0, Math.max(0, video.currentTime - 2));
+                                    await new Promise(r => sb.addEventListener('updateend', r, {once: true}));
+                                }
+                                sb.appendBuffer(value);
+                            } else throw e;
+                        }
+                        
+                        // ── Buffer management ────────────────────────────
+                        // Trim old data behind playback to save memory.
+                        // Keep ~5s behind currentTime; trim every 50 appends.
+                        if (++appends % 50 === 0 && sb.buffered.length > 0) {
+                            const ct = video.currentTime;
+                            if (ct > 8) {
+                                if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, {once: true}));
+                                try {
+                                    sb.remove(0, ct - 5);
+                                    await new Promise(r => sb.addEventListener('updateend', r, {once: true}));
+                                } catch(e) {}
+                            }
+                        }
+                    }
+                } catch (e) {
+                    if (e.name !== 'AbortError') console.error('Stream error:', e);
+                }
+                
+                // Stream ended or errored
+                if (isStreaming) {
+                    setStatus('disconnected', 'Stream ended — click to restart');
+                    isStreaming = false;
+                    streamReader = null;
+                    updateUI();
+                }
+            });
+            
+            setupAudio();         // Route audio through AudioContext (gain starts at 0)
+            video.src = URL.createObjectURL(ms);
+            video.muted = true;   // Required for autoplay policy
+            // Audio chain: video (muted initially) → AudioContext → GainNode (0) → speakers
+            // When user unmutes: video.muted=false + GainNode.gain=volume → audio plays
+        }
+        
+        function stopStream() {
+            isStreaming = false;
+            if (streamReader) {
+                streamReader.cancel().catch(() => {});
+                streamReader = null;
+            }
+            const src = video.src;
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            if (src && src.startsWith('blob:')) URL.revokeObjectURL(src);
+            setStatus('disconnected', 'Disconnected');
+            updateUI();
+        }
+        
+        function togglePlay() {
+            resumeAudio();  // User gesture → resume AudioContext
+            if (!isStreaming) {
+                startStream();
+            } else if (video.paused) {
+                video.play().catch(() => {});
+            } else {
+                stopStream();
+            }
+        }
+        
+        // ── Video Events ────────────────────────────────────────────
+        
+        video.addEventListener('playing', () => {
+            isStreaming = true;
+            // Sync audio state: if user already unmuted, make sure audio is flowing
+            if (!isMuted && gainNode) {
+                video.muted = false;
+                gainNode.gain.value = volume / 100;
+                resumeAudio();
+            }
+            setStatus('connected', 'Connected - Streaming');
+            updateUI();
+        });
+        
+        video.addEventListener('waiting', () => {
+            setStatus('connecting', 'Buffering...');
+        });
+        
+        video.addEventListener('pause', () => {
+            if (isStreaming) setStatus('connecting', 'Paused');
+        });
+        
+        video.addEventListener('error', () => {
+            const err = video.error;
+            if (err && err.code !== MediaError.MEDIA_ERR_ABORTED) {
+                console.error('Video error:', err.code, err.message);
+                setStatus('disconnected', 'Stream error — click to retry');
+                isStreaming = false;
+                streamReader = null;
+                updateUI();
+            }
+        });
+        
+        video.addEventListener('stalled', () => {
+            setStatus('connecting', 'Buffering...');
+        });
+        
+        // ── UI Helpers ──────────────────────────────────────────────
+        
+        function setStatus(state, text) {
+            $('statusIndicator').className = 'status-indicator ' + state;
+            $('statusText').textContent = text;
+        }
+        
+        function updateUI() {
+            const playing = isStreaming && !video.paused;
+            $('overlay').classList.toggle('hidden', isStreaming);
+            $('playIcon').style.display = playing ? 'none' : 'block';
+            $('pauseIcon').style.display = playing ? 'block' : 'none';
+            $('liveBadge').style.display = isStreaming ? 'flex' : 'none';
+            
+            if (playing) showControls();
+            else { $$('.controls').classList.add('visible'); clearTimeout(hideTimeout); }
+        }
         
         function showControls() {
             const c = $$('.controls'), p = $$('.player-wrapper');
             c.classList.add('visible');
             p.classList.remove('hide-cursor');
             clearTimeout(hideTimeout);
-            if (isPlaying) hideTimeout = setTimeout(() => {
-                c.classList.remove('visible');
-                p.classList.add('hide-cursor');
-            }, HIDE_DELAY);
+            if (isStreaming && !video.paused) {
+                hideTimeout = setTimeout(() => {
+                    c.classList.remove('visible');
+                    p.classList.add('hide-cursor');
+                }, HIDE_DELAY);
+            }
         }
         
-        function updateUI() {
-            const playing = isPlaying;
-            $('overlay').classList.toggle('hidden', playing);
-            $('playIcon').style.display = playing ? 'none' : 'block';
-            $('pauseIcon').style.display = playing ? 'block' : 'none';
-            $('liveBadge').style.display = playing ? 'flex' : 'none';
-            $('statusIndicator').className = 'status-indicator ' + (playing ? 'connected' : 'disconnected');
-            $('statusText').textContent = playing ? 'Connected - Streaming' : 'Disconnected';
-            if (playing) showControls();
-            else { $$('.controls').classList.add('visible'); clearTimeout(hideTimeout); }
-        }
+        // ── Volume (Web Audio API GainNode) ────────────────────────
+        // All volume control goes through the AudioContext GainNode.
+        // video.volume is not used — createMediaElementSource routes
+        // audio exclusively through the Web Audio API graph.
         
         function setVolume(v) {
             volume = +v;
-            if (gainNode && !isMuted) gainNode.gain.value = v / 100;
+            resumeAudio();
+            if (v > 0 && isMuted) {
+                isMuted = false;
+                video.muted = false;  // Allow audio into AudioContext
+            }
+            if (gainNode) {
+                gainNode.gain.value = isMuted ? 0 : v / 100;
+            }
             updateVolumeIcon();
         }
         
@@ -319,118 +536,16 @@ def get_player_html() -> str:
         }
         
         function toggleMute() {
+            resumeAudio();  // AudioContext.resume() requires user gesture
             isMuted = !isMuted;
-            if (gainNode) gainNode.gain.value = isMuted ? 0 : volume / 100;
+            video.muted = isMuted;  // Gate audio flow into AudioContext
+            if (gainNode) {
+                gainNode.gain.value = isMuted ? 0 : volume / 100;
+            }
             updateVolumeIcon();
         }
         
-        async function togglePlay() {
-            isPlaying ? stopStream() : await startStream();
-        }
-        
-        function stopStream() {
-            isPlaying = false;
-            
-            // Capture current frame as still image before disconnecting
-            const video = $('video');
-            if (video.src && video.naturalWidth > 0) {
-                try {
-                    const canvas = document.createElement('canvas');
-                    canvas.width = video.naturalWidth;
-                    canvas.height = video.naturalHeight;
-                    canvas.getContext('2d').drawImage(video, 0, 0);
-                    video.src = canvas.toDataURL('image/jpeg', 0.95);
-                } catch (e) {
-                    // If canvas capture fails, just keep last src (will stop when connection closes)
-                }
-            }
-            
-            abortCtrl?.abort();
-            audioCtx?.close();
-            audioCtx = gainNode = null;
-            updateUI();
-        }
-        
-        async function startStream() {
-            isPlaying = true;
-            let hasAudio = true;
-            updateUI();
-            $('statusIndicator').className = 'status-indicator connecting';
-            $('statusText').textContent = 'Connecting...';
-            
-            // Start video immediately
-            $('video').src = '/live?' + Date.now();
-            
-            // Try to start audio (optional - may not be available for camera sources)
-            try {
-                audioCtx = new AudioContext({ sampleRate: 44100 });
-                gainNode = audioCtx.createGain();
-                gainNode.gain.value = isMuted ? 0 : volume / 100;
-                gainNode.connect(audioCtx.destination);
-                
-                abortCtrl = new AbortController();
-                const res = await fetch('/audio', { signal: abortCtrl.signal });
-                
-                // Check if we got actual audio data
-                if (!res.ok || !res.body) {
-                    throw new Error('No audio stream available');
-                }
-                
-                const reader = res.body.getReader();
-                
-                let hdrSkipped = false, hdrBuf = new Uint8Array(0);
-                let nextTime = audioCtx.currentTime + 0.1;
-                let gotAudioData = false;
-                
-                updateUI();
-                
-                while (isPlaying) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    
-                    // If we read but get no data after header, audio might be disabled
-                    if (!gotAudioData && value && value.length > 0) {
-                        gotAudioData = true;
-                    }
-                    
-                    let data = value;
-                    if (!hdrSkipped) {
-                        hdrBuf = new Uint8Array([...hdrBuf, ...value]);
-                        if (hdrBuf.length >= 44) { data = hdrBuf.slice(44); hdrSkipped = true; }
-                        else continue;
-                    }
-                    
-                    if (data.length < 4) continue;
-                    
-                    const samples = Math.floor(data.length / 4);
-                    const buf = audioCtx.createBuffer(2, samples, 44100);
-                    const L = buf.getChannelData(0), R = buf.getChannelData(1);
-                    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-                    
-                    for (let i = 0; i < samples; i++) {
-                        L[i] = view.getInt16(i * 4, true) / 32768;
-                        R[i] = view.getInt16(i * 4 + 2, true) / 32768;
-                    }
-                    
-                    const src = audioCtx.createBufferSource();
-                    src.buffer = buf;
-                    src.connect(gainNode);
-                    if (nextTime < audioCtx.currentTime) nextTime = audioCtx.currentTime + 0.05;
-                    src.start(nextTime);
-                    nextTime += buf.duration;
-                }
-            } catch (e) {
-                // Audio failed - continue with video only
-                if (e.name !== 'AbortError') {
-                    console.debug('Audio unavailable (video-only mode):', e.message);
-                    hasAudio = false;
-                    // Don't show error - just indicate video-only mode
-                    if (isPlaying) {
-                        $('statusText').textContent = 'Connected (video only)';
-                    }
-                }
-            }
-        }
+        // ── Fullscreen ──────────────────────────────────────────────
         
         function toggleFullscreen() {
             const p = $$('.player-wrapper');
@@ -450,6 +565,8 @@ def get_player_html() -> str:
         document.addEventListener('fullscreenchange', updateFsIcon);
         document.addEventListener('webkitfullscreenchange', updateFsIcon);
         
+        // ── Keyboard shortcuts ──────────────────────────────────────
+        
         document.addEventListener('keydown', e => {
             if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
             else if (e.code === 'KeyM') toggleMute();
@@ -458,15 +575,17 @@ def get_player_html() -> str:
             else if (e.code === 'ArrowDown') { e.preventDefault(); setVolume(Math.max(0, volume - 10)); $('volume').value = volume; }
         });
         
+        // ── Mouse interaction ───────────────────────────────────────
+        
         $$('.player-wrapper').addEventListener('mousemove', showControls);
-        $$('.player-wrapper').addEventListener('mouseleave', () => isPlaying && $$('.controls').classList.remove('visible'));
+        $$('.player-wrapper').addEventListener('mouseleave', () => isStreaming && $$('.controls').classList.remove('visible'));
         $$('.controls').addEventListener('mouseenter', () => clearTimeout(hideTimeout));
-        $$('.controls').addEventListener('mouseleave', () => isPlaying && (hideTimeout = setTimeout(() => {
+        $$('.controls').addEventListener('mouseleave', () => isStreaming && (hideTimeout = setTimeout(() => {
             $$('.controls').classList.remove('visible');
             $$('.player-wrapper').classList.add('hide-cursor');
         }, HIDE_DELAY)));
         
-        // Auto-play on page load
+        // Auto-start on page load
         window.addEventListener('load', () => startStream());
     </script>
 </body>

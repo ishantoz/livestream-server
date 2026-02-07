@@ -1,14 +1,14 @@
 """
-HTTP request handlers for the streaming server.
-Implements ASGI handlers for video, audio, and web interface.
+Request handlers for the streaming server.
+HTTP stream handler for fMP4 video, stats endpoint.
 """
 
 import asyncio
+import json
 import logging
 from typing import Any, Callable, Awaitable, Dict, List, Tuple
 
 from lib.config import config
-from lib.wav import create_streaming_wav_header, WavParams
 from services.connection import connection_manager
 from services.broadcaster import broadcaster
 
@@ -23,154 +23,100 @@ Send = Callable[[Dict[str, Any]], Awaitable[None]]
 Headers = List[Tuple[bytes, bytes]]
 
 
-class BaseHandler:
-    """Base class for HTTP handlers."""
+class HttpStreamHandler:
+    """Handler for HTTP fMP4 video streaming.
+    
+    Protocol:
+    1. Client requests GET /stream
+    2. Server responds with Content-Type: video/mp4 (no Content-Length = streaming)
+    3. Server sends cached init segment (ftyp + moov)
+    4. Server streams fMP4 media chunks (moof + mdat) as HTTP response body
+    5. Connection stays open until client disconnects
+    
+    The browser's native <video> element plays fMP4 directly — no JavaScript,
+    no MediaSource Extensions, no WebSocket. Perfect A/V sync handled by browser.
+    """
     
     @staticmethod
-    async def send_response(
-        send: Send,
-        status: int,
-        headers: Headers,
-        body: bytes = b""
-    ) -> None:
-        """Send a complete HTTP response."""
+    async def handle(scope: Scope, receive: Receive, send: Send) -> None:
+        """Handle HTTP stream request."""
+        # Register client with backpressure queue
+        client = await connection_manager.register_client(
+            maxsize=config.video.chunk_buffer_size
+        )
+        
+        if client is None:
+            # Server full — return 503
+            body = b"Server at capacity, try again later"
+            await send({
+                "type": "http.response.start",
+                "status": 503,
+                "headers": [
+                    (b"content-type", b"text/plain"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+        
+        # Send response headers — no Content-Length means chunked/streaming
         await send({
             "type": "http.response.start",
-            "status": status,
-            "headers": headers,
-        })
-        await send({
-            "type": "http.response.body",
-            "body": body,
-        })
-    
-    @staticmethod
-    async def send_error(send: Send, status: int, message: str) -> None:
-        """Send an error response."""
-        body = f'{{"error": "{message}"}}'.encode()
-        await BaseHandler.send_response(
-            send,
-            status,
-            [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
+            "status": 200,
+            "headers": [
+                (b"content-type", b"video/mp4"),
+                (b"cache-control", b"no-cache, no-store"),
+                (b"access-control-allow-origin", b"*"),
             ],
-            body
-        )
-
-
-class VideoStreamHandler(BaseHandler):
-    """Handler for MJPEG video streaming."""
-    
-    @staticmethod
-    async def handle(scope: Scope, receive: Receive, send: Send) -> None:
-        """Handle video stream request."""
-        # Register client
-        client = await connection_manager.register_video_client(
-            maxsize=config.video.frame_buffer_size
-        )
-        
-        if client is None:
-            await VideoStreamHandler.send_error(send, 503, "Server at capacity")
-            return
-        
-        # Send headers for MJPEG stream
-        headers: Headers = [
-            (b"content-type", b"multipart/x-mixed-replace; boundary=frame"),
-            (b"connection", b"keep-alive"),
-            (b"cache-control", b"no-cache, no-store, must-revalidate"),
-            (b"pragma", b"no-cache"),
-            (b"expires", b"0"),
-            (b"access-control-allow-origin", b"*"),
-        ]
-        
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": headers,
         })
         
-        try:
-            # Send current frame immediately if available
-            current = broadcaster.current_frame
-            if current:
-                await send({
-                    "type": "http.response.body",
-                    "body": current,
-                    "more_body": True,
-                })
-            
-            # Stream frames
-            while True:
-                frame = await client.get(timeout=config.server.connection_timeout)
-                
-                if frame is None:
-                    # Timeout - send empty to keep connection alive
-                    continue
-                
-                try:
-                    await send({
-                        "type": "http.response.body",
-                        "body": frame,
-                        "more_body": True,
-                    })
-                except (Exception, asyncio.CancelledError):
-                    break
-                    
-        except (Exception, asyncio.CancelledError) as e:
-            logger.debug(f"Video client disconnected: {e}")
-        finally:
+        # Wait for init segment (broadcaster might still be starting)
+        init = connection_manager.init_segment
+        for _ in range(100):  # Up to 10 seconds
+            if init is not None:
+                break
+            await asyncio.sleep(0.1)
+            init = connection_manager.init_segment
+        
+        if init is None:
+            logger.warning("No init segment available after 10s, closing stream")
             await connection_manager.unregister_client(client)
-
-
-class AudioStreamHandler(BaseHandler):
-    """Handler for WAV audio streaming."""
-    
-    @staticmethod
-    async def handle(scope: Scope, receive: Receive, send: Send) -> None:
-        """Handle audio stream request."""
-        # Register client
-        client = await connection_manager.register_audio_client(
-            maxsize=config.audio.buffer_size
-        )
-        
-        if client is None:
-            await AudioStreamHandler.send_error(send, 503, "Server at capacity")
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
             return
         
-        # Send headers for WAV stream
-        headers: Headers = [
-            (b"content-type", b"audio/wav"),
-            (b"connection", b"keep-alive"),
-            (b"cache-control", b"no-cache, no-store, must-revalidate"),
-            (b"access-control-allow-origin", b"*"),
-        ]
+        # Send init segment (ftyp + moov) — browser needs this first
+        try:
+            await send({
+                "type": "http.response.body",
+                "body": init,
+                "more_body": True,
+            })
+        except Exception:
+            await connection_manager.unregister_client(client)
+            return
         
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": headers,
-        })
+        # Monitor for client disconnect
+        disconnect_event = asyncio.Event()
         
-        # Send WAV header
-        wav_header = create_streaming_wav_header(WavParams(
-            sample_rate=config.audio.sample_rate,
-            channels=config.audio.channels,
-            bits_per_sample=config.audio.bits_per_sample,
-        ))
+        async def watch_disconnect():
+            try:
+                while True:
+                    msg = await receive()
+                    if msg["type"] == "http.disconnect":
+                        disconnect_event.set()
+                        return
+            except (asyncio.CancelledError, Exception):
+                disconnect_event.set()
         
-        await send({
-            "type": "http.response.body",
-            "body": wav_header,
-            "more_body": True,
-        })
+        disconnect_task = asyncio.create_task(watch_disconnect())
         
         try:
-            # Stream audio chunks
-            while True:
+            # Stream fMP4 chunks to client
+            while not disconnect_event.is_set():
                 chunk = await client.get(timeout=config.server.connection_timeout)
                 
                 if chunk is None:
+                    # Timeout — connection still alive, just no data yet
                     continue
                 
                 try:
@@ -182,20 +128,32 @@ class AudioStreamHandler(BaseHandler):
                 except (Exception, asyncio.CancelledError):
                     break
                     
-        except (Exception, asyncio.CancelledError) as e:
-            logger.debug(f"Audio client disconnected: {e}")
+        except (Exception, asyncio.CancelledError):
+            pass
         finally:
+            disconnect_task.cancel()
+            try:
+                await disconnect_task
+            except asyncio.CancelledError:
+                pass
             await connection_manager.unregister_client(client)
+            # Close HTTP response
+            try:
+                await send({
+                    "type": "http.response.body",
+                    "body": b"",
+                    "more_body": False,
+                })
+            except Exception:
+                pass
 
 
-class StatsHandler(BaseHandler):
-    """Handler for server statistics."""
+class StatsHandler:
+    """Handler for server statistics (HTTP)."""
     
     @staticmethod
     async def handle(scope: Scope, receive: Receive, send: Send) -> None:
         """Handle stats request."""
-        import json
-        
         stream_stats = broadcaster.stats
         
         stats = {
@@ -205,28 +163,29 @@ class StatsHandler(BaseHandler):
             },
             "stream": {
                 "elapsed_seconds": round(stream_stats.elapsed, 2),
-                "video_frames": stream_stats.video_frames,
-                "audio_chunks": stream_stats.audio_chunks,
-                "video_timestamp": round(stream_stats.video_timestamp(), 3),
-                "audio_timestamp": round(stream_stats.audio_timestamp(), 3),
-                "sync_drift": round(stream_stats.video_timestamp() - stream_stats.audio_timestamp(), 3),
+                "chunks_sent": stream_stats.chunks_sent,
+                "bytes_sent": stream_stats.bytes_sent,
             },
             "connections": connection_manager.get_stats(),
             "config": {
                 "video_fps": config.video.fps,
-                "audio_sample_rate": config.audio.sample_rate,
+                "video_crf": config.video.effective_crf,
+                "audio_bitrate": config.video.audio_bitrate,
             }
         }
         
         body = json.dumps(stats, indent=2).encode()
         
-        await StatsHandler.send_response(
-            send,
-            200,
-            [
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode()),
                 (b"access-control-allow-origin", b"*"),
             ],
-            body
-        )
+        })
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })

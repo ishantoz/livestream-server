@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Live Stream</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        surface:  { DEFAULT: '#0c0e14', 2: '#13161e', 3: '#1a1d28', 4: '#222633' },
+                        border:   { DEFAULT: '#262a38', light: '#323750' },
+                        accent:   { DEFAULT: '#6366f1', light: '#818cf8' },
+                        live:     { DEFAULT: '#f43f5e', bg: 'rgba(244,63,94,.12)' },
+                        ok:       '#34d399',
+                        warn:     '#fbbf24',
+                        err:      '#f87171',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'sans-serif'],
+                        mono: ['SF Mono', 'Fira Code', 'monospace'],
+                    },
+                }
+            }
+        }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/player.css">
+</head>
+<body class="bg-surface min-h-screen min-h-[100dvh] flex flex-col font-sans text-white antialiased">
+
+    <!-- ─── Top Bar ─────────────────────────────────────── -->
+    <header class="flex-shrink-0 flex items-center justify-between h-14 sm:h-[52px] px-4 sm:px-6 border-b border-border bg-surface-2/50 fixed top-0 left-0 right-0 z-20">
+        <div class="flex items-center gap-2.5">
+            <span class="text-base sm:text-[15px] font-semibold tracking-tight">Live Stream</span>
+        </div>
+
+        <!-- Center badge -->
+        <div class="absolute left-1/2 -translate-x-1/2">
+            <div id="liveBadge" class="hidden items-center gap-2 bg-live-bg border border-live/25 text-live text-xs font-bold tracking-wider px-3 py-1 rounded-full">
+                <span class="live-dot"></span>
+                LIVE
+            </div>
+            <div id="offlineBadge" class="flex items-center gap-1.5 text-zinc-500 text-xs font-medium">
+                <span class="w-1.5 h-1.5 rounded-full bg-zinc-600"></span>
+                Offline
+            </div>
+        </div>
+
+        <div class="flex items-center gap-3 text-zinc-400">
+            <span id="statusPill" class="hidden sm:flex items-center gap-1.5 text-xs">
+                <span id="headerDot" class="w-1.5 h-1.5 rounded-full bg-zinc-600"></span>
+                <span id="headerStatus" class="text-zinc-400">Ready</span>
+            </span>
+            <span class="text-xs font-mono text-zinc-500 tabular-nums hidden sm:block" id="clock">--:--</span>
+        </div>
+    </header>
+
+    <!-- ─── Player Area ─────────────────────────────────── -->
+    <main class="flex-1 flex flex-col items-center justify-center p-3 sm:p-5 lg:p-6 min-h-0 gap-3 sm:gap-4">
+
+        <div class="ambient-wrap w-full max-w-7xl relative">
+            <!-- Ambient glow canvas (blurred mirror of video) -->
+            <canvas id="ambientCanvas" class="ambient-canvas" width="32" height="18"></canvas>
+
+            <div id="playerGlow" class="player-glass rounded-2xl sm:rounded-3xl transition-all duration-500 relative z-10">
+                <div id="playerWrapper" class="player-wrapper bg-surface-2/50 relative rounded-xl sm:rounded-2xl overflow-hidden aspect-video">
+                    <video id="video" class="w-full h-full block object-contain" playsinline muted></video>
+
+                <!-- Overlay -->
+                <div id="overlay" class="absolute inset-0 bg-surface-2/50 backdrop-blur-[3px] flex flex-col items-center justify-center gap-4 sm:gap-5 transition-opacity duration-300 z-10">
+                    <button id="overlayBtn" class="group relative w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-accent text-white flex items-center justify-center shadow-lg shadow-accent/25 hover:shadow-accent/40 hover:scale-105 active:scale-95 transition-all cursor-pointer">
+                        <svg class="w-7 h-7 sm:w-8 sm:h-8 ml-0.5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                    </button>
+                    <div class="text-center px-4">
+                        <p id="overlayText" class="text-white/80 text-sm sm:text-base font-medium">Tap to start stream</p>
+                        <p class="text-white/40 text-xs sm:text-sm mt-1 hidden sm:block">or press Space</p>
+                    </div>
+                </div>
+
+                <!-- Controls -->
+                <div id="controls" class="controls absolute bottom-0 inset-x-0 z-10 ctrl-gradient px-3 pb-3 pt-14 sm:px-5 sm:pb-4 sm:pt-20 flex items-center gap-2 sm:gap-3 opacity-0 pointer-events-none transition-opacity duration-200">
+                    <!-- Play / Stop -->
+                    <button id="playBtn" class="ctrl-btn ctrl-btn-primary" title="Play / Stop">
+                        <svg id="playIcon" class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                        <svg id="pauseIcon" class="w-5 h-5 hidden" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                    </button>
+
+                    <!-- Mute -->
+                    <button id="muteBtn" class="ctrl-btn" title="Mute">
+                        <svg id="volumeIcon" class="w-5 h-5 hidden" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+                        <svg id="muteIcon" class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+                    </button>
+
+                    <!-- Volume (desktop only) -->
+                    <input type="range" id="volume" class="volume-slider hidden sm:block" min="0" max="100" value="70">
+
+                    <div class="flex-1"></div>
+
+                    <!-- Duration -->
+                    <span id="liveDuration" class="text-xs font-mono text-white/50 tabular-nums hidden">00:00:00</span>
+
+                    <!-- Fullscreen -->
+                    <button id="fsBtn" class="ctrl-btn" title="Fullscreen">
+                        <svg id="expandIcon" class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+                        <svg id="compressIcon" class="w-5 h-5 hidden" viewBox="0 0 24 24" fill="currentColor"><path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/></svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+        </div>
+
+        <!-- ─── Info Bar ──────────────────────────────────── -->
+        <div class="w-full max-w-6xl flex flex-wrap items-center gap-x-5 gap-y-2 px-2 py-2">
+            <!-- Status -->
+            <div class="flex items-center gap-2">
+                <span id="statusDot" class="status-dot disconnected"></span>
+                <span id="statusText" class="text-sm text-zinc-300">Ready to stream</span>
+            </div>
+
+            <span class="hidden sm:block w-px h-4 bg-zinc-700"></span>
+
+            <!-- Uptime -->
+            <div class="flex items-center gap-1.5 text-sm text-zinc-400">
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                <span id="uptimeText" class="font-mono tabular-nums">--:--:--</span>
+            </div>
+
+            <span class="hidden sm:block w-px h-4 bg-zinc-700"></span>
+
+            <!-- Buffer -->
+            <div class="flex items-center gap-1.5 text-sm text-zinc-400">
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                <span id="bufferText">--</span>
+            </div>
+
+            <!-- Shortcuts (desktop only) -->
+            <div class="hidden md:flex items-center gap-1.5 ml-auto">
+                <kbd>Space</kbd>
+                <kbd>M</kbd>
+                <kbd>F</kbd>
+            </div>
+        </div>
+    </main>
+
+    <script src="/player.js"></script>
+</body>
+</html>
