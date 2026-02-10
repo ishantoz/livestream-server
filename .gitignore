@@ -25,3 +25,5 @@ wheels/
 *.ogg
 *.aac
 *.m4a
+
+.env*

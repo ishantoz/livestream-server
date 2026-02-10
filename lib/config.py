@@ -7,6 +7,9 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 class SourceType(Enum):

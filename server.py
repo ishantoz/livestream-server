@@ -5,6 +5,9 @@ import asyncio
 import logging
 from services.broadcaster import broadcaster
 
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path="./.env")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
